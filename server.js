@@ -123,7 +123,10 @@ function rms(int16) {
 
 // ------------------ ROUTES ------------------
 
-app.get('/health', (_req, res) => res.send('ok'));
+app.get('/health', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 
 // Click-to-call test endpoint (POST {to?})
 app.post('/call', async (req, res) => {
