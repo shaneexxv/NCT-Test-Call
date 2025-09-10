@@ -28,7 +28,14 @@ app.use(express.json());
 app.use(express.static('public'));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN,
+  {
+    edge: 'dublin',  // Force Twilio to use Ireland edge servers
+    region: 'ie1'    // Optional, but improves stability
+  }
+);
 
 // Node 18 has global fetch; provide fallback if needed
 const _fetch = (...args) =>
