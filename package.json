@@ -1,15 +1,9 @@
 {
-  "name": "nct-test-call",
+  "name": "elevenlabs-webcall",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "dotenv": "^16.6.1",
-    "express": "^4.21.2",
-    "twilio": "^4.23.0",
-    "ws": "^8.18.3"
-  }
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" }
 }
