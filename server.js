@@ -1,4 +1,4 @@
-// server.js — Twilio <-> ElevenLabs with VAD + jitter buffer + keepalive + test-call routes
+// server.js — Twilio <-> ElevenLabs with VAD, jitter buffer, keepalive, and robust routes
 import 'dotenv/config';
 import express from 'express';
 import twilio from 'twilio';
@@ -20,7 +20,7 @@ const {
   // Diagnostics / tuning
   DEBUG_LOGS = 'false',
   DEBUG_VAD = 'false',
-  TWILIO_EDGE = 'dublin',           // 'dublin' | 'frankfurt' | ...
+  TWILIO_EDGE = 'dublin',
   TWILIO_REGION = 'ie1',
   OUT_JITTER_MS = '100',            // EL -> Twilio buffer (ms)
   PREBUFFER_MS = '250',             // initial TTS prebuffer (ms)
@@ -36,7 +36,6 @@ app.use(express.json());
 app.use(express.static('public'));
 
 /* ------------------ Twilio Client ------------------ */
-// Prefer API Key auth; fallback to Account SID + Auth Token
 let client;
 if (TWILIO_API_KEY_SID && TWILIO_API_KEY_SECRET) {
   client = twilio(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, {
@@ -52,32 +51,26 @@ if (TWILIO_API_KEY_SID && TWILIO_API_KEY_SECRET) {
 }
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
-// Node 18 has global fetch; provide fallback if needed
+// Node 18 has global fetch; fallback if needed
 const _fetch = (...args) =>
   (globalThis.fetch ? globalThis.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args)));
 
 /* ------------------ AUDIO HELPERS ------------------ */
-
-// μ-law byte -> PCM16 sample
 function muLawDecodeByte(mu) {
   mu = ~mu & 0xff;
   const sign = mu & 0x80 ? -1 : 1;
   const exp = (mu >> 4) & 0x07;
   const mant = mu & 0x0f;
   let sample = ((mant << 4) + 0x08) << (exp + 3);
-  sample -= 0x84; // bias
+  sample -= 0x84;
   return sign * sample;
 }
-
-// base64 μ-law -> Int16Array PCM (8 kHz)
 function muLawB64ToPCM16(b64) {
   const u = Buffer.from(b64, 'base64');
   const out = new Int16Array(u.length);
   for (let i = 0; i < u.length; i++) out[i] = muLawDecodeByte(u[i]);
   return out;
 }
-
-// Linear resample Int16Array from inRate -> outRate
 function resampleInt16(int16, inRate, outRate) {
   const inLen = int16.length;
   if (inLen === 0 || inRate === outRate) return int16;
@@ -92,15 +85,11 @@ function resampleInt16(int16, inRate, outRate) {
   }
   return out;
 }
-
-// Int16Array -> base64 PCM16LE
 function int16ToPCM16LEBase64(int16) {
   const buf = Buffer.alloc(int16.length * 2);
   for (let i = 0; i < int16.length; i++) buf.writeInt16LE(int16[i], i * 2);
   return buf.toString('base64');
 }
-
-// PCM16 sample -> μ-law byte (for Twilio playback)
 function linearToMuLawSample(sample) {
   if (sample > 32767) sample = 32767;
   if (sample < -32768) sample = -32768;
@@ -114,8 +103,6 @@ function linearToMuLawSample(sample) {
   const mantissa = (sample >> (exponent + 3)) & 0x0F;
   return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
-
-// base64 PCM16LE @ any rate -> base64 μ-law @ 8k
 function pcm16b64ToMuLaw8kB64_fromAnyRate(b64, inRate) {
   const pcm = Buffer.from(b64, 'base64');
   const inLen = Math.floor(pcm.length / 2);
@@ -134,8 +121,6 @@ function pcm16b64ToMuLaw8kB64_fromAnyRate(b64, inRate) {
   }
   return out.toString('base64');
 }
-
-// Simple RMS
 function rms(int16) {
   let acc = 0;
   const n = int16.length || 1;
@@ -144,7 +129,6 @@ function rms(int16) {
 }
 
 /* ------------------ ROUTES ------------------ */
-
 app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
 // TwiML → open a bidirectional stream
@@ -156,26 +140,29 @@ app.all('/twiml', (req, res) => {
   res.type('text/xml').send(vr.toString());
 });
 
-// shared call handler for /call and /test/call
-function validateE164(n) { return /^\+\d{7,15}$/.test(n || ''); }
+// version probe to confirm deployed routes
+app.get('/_version', (_req, res) => {
+  res.json({
+    routes: ['/health', '/twiml', '/call (GET/POST)', '/test/call (GET/POST)'],
+    edge: process.env.TWILIO_EDGE || 'dublin',
+    region: process.env.TWILIO_REGION || 'ie1'
+  });
+});
 
+function isE164(n){ return /^\+\d{7,15}$/.test(n || ''); }
 async function placeCall(req, res) {
   try {
-    const to = (req.body?.to || '').replace(/[^\d+]/g, '');
-    if (!validateE164(to)) {
-      return res.status(400).json({ error: 'Provide a valid +E.164 number, e.g. +353851234567' });
-    }
-    if (!validateE164(TWILIO_CALLER_ID)) {
-      return res.status(500).json({ error: 'TWILIO_CALLER_ID is missing or not E.164' });
-    }
-    if (!BASE_URL) {
-      return res.status(500).json({ error: 'BASE_URL is not set' });
-    }
+    const raw = req.body?.to || req.query?.to || '';
+    const to  = raw.replace(/[^\d+]/g, '');
+    if (!isE164(to))       return res.status(400).json({ error: 'Provide +E.164 like +353851234567' });
+    if (!isE164(TWILIO_CALLER_ID)) return res.status(500).json({ error: 'TWILIO_CALLER_ID missing/invalid' });
+    if (!BASE_URL)         return res.status(500).json({ error: 'BASE_URL is not set' });
+
     const call = await client.calls.create({
       to,
       from: TWILIO_CALLER_ID,
       url: `${BASE_URL}/twiml`,
-      method: 'POST',
+      method: 'POST'
     });
     return res.json({ message: `Calling ${to}`, sid: call.sid });
   } catch (e) {
@@ -183,22 +170,18 @@ async function placeCall(req, res) {
     if (DEBUG) console.error('Twilio call error:', status, e.code, e.message, e.moreInfo || '');
     return res.status(status).json({
       error: 'Twilio API Error',
-      code: e.code,
-      message: e.message,
-      details: e.moreInfo || null,
+      code: e.code, message: e.message,
+      details: e.moreInfo || null
     });
   }
 }
-
-// accept either path
-app.post(['/call', '/test/call'], placeCall);
+// accept BOTH endpoints and BOTH methods
+app.all(['/call', '/test/call'], placeCall);
 
 /* ------------------ WS BRIDGE ------------------ */
-
 const wss = new WebSocketServer({ noServer: true });
 const server = app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on 0.0.0.0:${PORT}`));
 
-// Accept /media even with query (?streamSid=...)
 server.on('upgrade', (req, socket, head) => {
   const path = (req.url || '').split('?')[0];
   if (path === '/media') {
@@ -210,30 +193,30 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', async (twilioWS) => {
-  /* ---- Keep the Twilio WS alive ---- */
+  // Keep Twilio WS alive
   const ka = setInterval(() => {
     try { if (twilioWS.readyState === WebSocket.OPEN) twilioWS.ping(); } catch {}
   }, 15000);
   twilioWS.on('close', () => clearInterval(ka));
   twilioWS.on('error', () => clearInterval(ka));
 
-  // VAD state (fast + robust)
+  // VAD state
   let speaking = false;
   let lastVoiceMs = Date.now();
   let lastStartedAt = 0;
   let smooth = 0;
-  const VOICE_ON_RMS  = 700;     // lower = more sensitive
+  const VOICE_ON_RMS  = 700;
   const VOICE_OFF_RMS = 300;
-  const SILENCE_MS    = 400;     // quick stop for snappy replies
-  const MAX_UTTERANCE_MS = 7000; // hard cut after very long speech
-  const FALLBACK_MS      = 1200; // ensure we always send a stop
-  const SMOOTH_A = 0.7;          // EMA smoothing factor
+  const SILENCE_MS    = 400;
+  const MAX_UTTERANCE_MS = 7000;
+  const FALLBACK_MS      = 1200;
+  const SMOOTH_A = 0.7;
 
   let streamSid = null;
   let elOutFmt = 'pcm_16000';
   let elOutRate = 16000;
 
-  /* ---- Outbound jitter buffer (EL -> Twilio) ---- */
+  // Outbound jitter buffer (EL -> Twilio)
   const FRAME_MS = 20;
   let outQueue = [];
   let pumpTimer = null;
@@ -245,30 +228,18 @@ wss.on('connection', async (twilioWS) => {
     pumpTimer = setInterval(() => {
       if (outQueue.length && twilioWS.readyState === WebSocket.OPEN) {
         const payloadB64 = outQueue.shift();
-        twilioWS.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: payloadB64 }
-        }));
+        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: payloadB64 } }));
       }
     }, FRAME_MS);
   }
-
   function sendToTwilio(payloadB64) {
     outQueue.push(payloadB64);
     if (outQueue.length * FRAME_MS >= OUTBUF_MS) startPump();
   }
-
   function startNewReply() {
-    if (PREFILL_MS > 0) {
-      buffering = true;
-      prebuffer = [];
-    } else {
-      buffering = false;
-      prebuffer = [];
-    }
+    if (PREFILL_MS > 0) { buffering = true; prebuffer = []; }
+    else               { buffering = false; prebuffer = []; }
   }
-
   function handleTTSChunk(payloadB64) {
     if (buffering) {
       prebuffer.push(payloadB64);
@@ -283,11 +254,10 @@ wss.on('connection', async (twilioWS) => {
     }
   }
 
-  /* ---- Open ElevenLabs WS ---- */
+  // Open ElevenLabs
   async function openElevenLabsWS() {
     const id = ELEVENLABS_AGENT_ID || '';
     if (!id) throw new Error('ELEVENLABS_AGENT_ID missing');
-
     if (id.startsWith('agent_')) {
       return new WebSocket(`wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(id)}`);
     }
@@ -302,19 +272,12 @@ wss.on('connection', async (twilioWS) => {
   }
 
   let elWS;
-  try {
-    elWS = await openElevenLabsWS();
-  } catch (e) {
-    console.error('❌ EL connect failed:', e.message);
-    twilioWS.on('message', () => {}); // drain
-    return;
-  }
+  try { elWS = await openElevenLabsWS(); }
+  catch (e) { console.error('❌ EL connect failed:', e.message); twilioWS.on('message', () => {}); return; }
 
-  /* ---- Keep EL WS alive ---- */
+  // Keep EL WS alive + set formats
   elWS.on('open', () => {
     if (DEBUG) console.log('🎙️  ElevenLabs WS open');
-
-    // We send PCM/16k upstream; ask EL to output PCM/16k (we will downsample to 8k μ-law for Twilio)
     const init = {
       type: 'conversation_initiation_client_data',
       conversation_config_override: {
@@ -323,22 +286,17 @@ wss.on('connection', async (twilioWS) => {
       }
     };
     try { elWS.send(JSON.stringify(init)); } catch {}
-
-    // keepalive
-    const elKA = setInterval(() => {
-      try { if (elWS.readyState === WebSocket.OPEN) elWS.ping(); } catch {}
-    }, 15000);
+    const elKA = setInterval(() => { try { if (elWS.readyState === WebSocket.OPEN) elWS.ping(); } catch {} }, 15000);
     elWS.on('close', () => clearInterval(elKA));
     elWS.on('error', () => clearInterval(elKA));
   });
   elWS.on('error', e => console.error('❌ ElevenLabs WS error:', e.message));
   elWS.on('close', () => { if (DEBUG) console.log('🛑 ElevenLabs WS closed'); });
 
-  // EL -> Twilio (agent audio)
+  // EL -> Twilio
   elWS.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-
       if (data.type === 'conversation_initiation_metadata') {
         const meta = data.conversation_initiation_metadata_event || {};
         elOutFmt = meta.agent_output_audio_format || elOutFmt;
@@ -350,16 +308,9 @@ wss.on('connection', async (twilioWS) => {
         });
         return;
       }
-
-      if (data.type === 'agent_response') {
-        // new reply begins → enable prebuffer
-        startNewReply();
-        return;
-      }
-
+      if (data.type === 'agent_response') { startNewReply(); return; }
       if (data.type === 'audio' && streamSid && twilioWS.readyState === WebSocket.OPEN) {
-        const pcmB64 = data?.audio_event?.audio_base_64;
-        if (!pcmB64) return;
+        const pcmB64 = data?.audio_event?.audio_base_64; if (!pcmB64) return;
         const ulawB64 = pcm16b64ToMuLaw8kB64_fromAnyRate(pcmB64, elOutRate || 16000);
         handleTTSChunk(ulawB64);
         return;
@@ -371,62 +322,39 @@ wss.on('connection', async (twilioWS) => {
   twilioWS.on('message', (buf) => {
     try {
       const msg = JSON.parse(buf.toString());
-
       if (msg.event === 'start') {
         streamSid = msg.start?.streamSid || msg.streamSid || null;
         if (DEBUG) console.log('▶️ Twilio stream started', streamSid, msg.start?.mediaFormat);
         return;
       }
-
       if (msg.event === 'media' && msg.media?.payload) {
-        // 1) Convert Twilio μ-law/8k -> PCM/16k for EL ASR
-        const pcm8 = muLawB64ToPCM16(msg.media.payload);   // Int16 @ 8k
-        const pcm16k = resampleInt16(pcm8, 8000, 16000);   // Int16 @ 16k
-        const b64pcm = int16ToPCM16LEBase64(pcm16k);       // base64 PCM16LE
+        const pcm8 = muLawB64ToPCM16(msg.media.payload);
+        const pcm16k = resampleInt16(pcm8, 8000, 16000);
+        const b64pcm = int16ToPCM16LEBase64(pcm16k);
+        if (elWS.readyState === WebSocket.OPEN) elWS.send(JSON.stringify({ user_audio_chunk: b64pcm }));
 
-        if (elWS.readyState === WebSocket.OPEN) {
-          elWS.send(JSON.stringify({ user_audio_chunk: b64pcm }));
-        }
-
-        // 2) VAD — EMA-smoothed RMS with fast stop + fallbacks
         const level = rms(pcm8);
         smooth = SMOOTH_A * smooth + (1 - SMOOTH_A) * level;
-
         const now = Date.now();
         if (smooth > VOICE_ON_RMS) {
           lastVoiceMs = now;
-          if (!speaking) {
-            try { elWS.send(JSON.stringify({ type: 'user_started_speaking' })); } catch {}
-            speaking = true;
-            lastStartedAt = now;
-            if (DBG_VAD) console.log('🎤 VAD start');
-          }
+          if (!speaking) { try { elWS.send(JSON.stringify({ type: 'user_started_speaking' })); } catch {}; speaking = true; lastStartedAt = now; if (DBG_VAD) console.log('🎤 VAD start'); }
         } else {
           const silentFor = now - lastVoiceMs;
           const longSpeech = speaking && (now - lastStartedAt) > MAX_UTTERANCE_MS;
           if (speaking && (silentFor > SILENCE_MS || longSpeech)) {
-            try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {}
-            speaking = false;
-            startNewReply(); // next agent turn
-            if (DBG_VAD) console.log('🤫 VAD stop', longSpeech ? '(max utterance)' : '');
+            try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {};
+            speaking = false; startNewReply(); if (DBG_VAD) console.log('🤫 VAD stop', longSpeech ? '(max utterance)' : '');
           }
         }
-
-        // 3) Safety fallback
         if (!speaking && lastStartedAt && (now - lastVoiceMs) > FALLBACK_MS && (now - lastStartedAt) > 500) {
-          try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {}
-          lastStartedAt = 0;
-          startNewReply();
-          if (DBG_VAD) console.log('🛟 VAD forced stop');
+          try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {};
+          lastStartedAt = 0; startNewReply(); if (DBG_VAD) console.log('🛟 VAD forced stop');
         }
-
         return;
       }
-
       if (msg.event === 'stop') {
-        if (speaking) {
-          try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {}
-        }
+        if (speaking) { try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {} }
         if (DEBUG) console.log('⏹️ Twilio stream stopped');
         try { elWS.close(); } catch {}
         try { twilioWS.close(); } catch {}
@@ -440,5 +368,4 @@ wss.on('connection', async (twilioWS) => {
   twilioWS.on('error', e => console.error('❌ Twilio WS error:', e.message));
   twilioWS.on('close', () => { try { elWS.close(); } catch {} });
 });
-
-/* ------------------ END ------------------ */
+// EOF
