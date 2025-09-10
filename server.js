@@ -49,6 +49,25 @@ if (TWILIO_API_KEY_SID && TWILIO_API_KEY_SECRET) {
     region: TWILIO_REGION,
   });
 }
+
+// Diagnostics: shows which auth path and vars the server is using (no secrets)
+app.get('/_diag', (_req, res) => {
+  res.json({
+    authMode:
+      process.env.TWILIO_API_KEY_SID && process.env.TWILIO_API_KEY_SECRET
+        ? 'apiKey'
+        : 'sidToken',
+    accountSid: process.env.TWILIO_ACCOUNT_SID || null,
+    hasAuthToken: Boolean(process.env.TWILIO_AUTH_TOKEN),
+    hasKeySid: Boolean(process.env.TWILIO_API_KEY_SID),
+    hasKeySecret: Boolean(process.env.TWILIO_API_KEY_SECRET),
+    callerId: process.env.TWILIO_CALLER_ID || null,
+    edge: process.env.TWILIO_EDGE || 'dublin',
+    region: process.env.TWILIO_REGION || 'ie1',
+    time: new Date().toISOString(),
+  });
+});
+
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // Node 18 has global fetch; fallback if needed
@@ -383,6 +402,16 @@ app.get('/_version', (_req, res) => {
     time: new Date().toISOString()
   });
 });
+
+app.get('/_diag', (_req, res) => {
+  res.json({
+    authMode: process.env.TWILIO_API_KEY_SID && process.env.TWILIO_API_KEY_SECRET ? 'apiKey' : 'sidToken',
+    accountSid: process.env.TWILIO_ACCOUNT_SID || null,
+    hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
+    callerId: process.env.TWILIO_CALLER_ID || null
+  });
+});
+
 
 });
 // EOF
