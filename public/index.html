@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NCT – Test Caller</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; display:grid; place-items:center; min-height:100vh; margin:0; }
+    .card { width: 480px; max-width: 92vw; padding: 24px; border: 1px solid #333; border-radius: 12px; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    p  { margin: 0 0 16px; opacity:.8; }
+    label { font-size:14px; opacity:.9; }
+    input { width:100%; padding:12px; margin:8px 0 14px; border-radius:8px; border:1px solid #555; background:transparent; color:inherit; }
+    button { width:100%; padding:12px 16px; font-size:16px; border:0; border-radius:8px; background:#e11; color:#fff; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    #status { margin-top:10px; font-size:14px; opacity:.9; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>NCT – Test Caller</h1>
+    <p>Tap the button. Your phone will ring. Answer to talk to the agent.</p>
+
+    <label for="to">Phone number (E.164, e.g. +353851234567)</label>
+    <input id="to" placeholder="+353851234567" />
+
+    <button id="callBtn">📞 Test Call</button>
+    <div id="status">Ready.</div>
+  </div>
+
+  <script>
+    const btn = document.getElementById('callBtn');
+    const statusEl = document.getElementById('status');
+    btn.onclick = async () => {
+      const to = document.getElementById('to').value.trim();
+      if (!/^\+\d{7,15}$/.test(to)) {
+        statusEl.textContent = 'Use E.164 format like +353851234567';
+        return;
+      }
+      btn.disabled = true; statusEl.textContent = 'Starting call…';
+      try {
+        const r = await fetch('/call', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ to })
+        });
+        const j = await r.json();
+        statusEl.textContent = j.message || 'Triggered.';
+      } catch (e) {
+        statusEl.textContent = 'Error making the call.';
+      } finally { btn.disabled = false; }
+    };
+  </script>
+</body>
+</html>
