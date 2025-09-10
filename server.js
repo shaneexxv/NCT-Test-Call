@@ -367,5 +367,22 @@ wss.on('connection', async (twilioWS) => {
 
   twilioWS.on('error', e => console.error('❌ Twilio WS error:', e.message));
   twilioWS.on('close', () => { try { elWS.close(); } catch {} });
+
+  // ------------------ VERSION CHECK ------------------
+app.get('/_version', (_req, res) => {
+  res.json({
+    status: 'ok',
+    routes: [
+      '/health',
+      '/twiml',
+      '/call (GET/POST)',
+      '/test/call (GET/POST)'
+    ],
+    edge: process.env.TWILIO_EDGE || 'dublin',
+    region: process.env.TWILIO_REGION || 'ie1',
+    time: new Date().toISOString()
+  });
+});
+
 });
 // EOF
