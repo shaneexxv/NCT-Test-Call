@@ -1,15 +1,13 @@
-// server.js — Twilio <-> ElevenLabs with fast VAD + proper codecs
-// One-question turn-taking depends on your agent prompt; this file handles audio + end-of-turn signalling.
-
+// server.js — Twilio <-> ElevenLabs with fast VAD + proper codecs + jitter buffer
 import 'dotenv/config';
 import express from 'express';
 import twilio from 'twilio';
 import WebSocket, { WebSocketServer } from 'ws';
 
-// ------------------ ENV ------------------
+/* ------------------ ENV ------------------ */
 const {
   PORT = 3000,
-  BASE_URL,                         // https ngrok URL, e.g. https://abcd-1234.ngrok-free.app
+  BASE_URL,                         // https public URL of THIS service (Railway)
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_CALLER_ID,                 // your Twilio number (+E.164)
@@ -17,11 +15,17 @@ const {
   ELEVENLABS_API_KEY,               // required for private agents
   TEST_PHONE_NUMBER,                // optional default test target
   DEBUG_LOGS = 'false',             // 'true' to see more logs
-  DEBUG_VAD = 'false'               // 'true' to log VAD start/stop
+  DEBUG_VAD = 'false',              // 'true' to log VAD start/stop
+  TWILIO_EDGE = 'dublin',           // override with 'frankfurt' if you want
+  TWILIO_REGION = 'ie1',            // stable IE routing
+  OUT_JITTER_MS = '100',            // outbound EL->Twilio jitter buffer (ms)
+  PREBUFFER_MS = '250',             // initial TTS prebuffer (ms)
 } = process.env;
 
-const DEBUG = (DEBUG_LOGS.toLowerCase() === 'true');
-const DBG_VAD = (DEBUG_VAD.toLowerCase() === 'true');
+const DEBUG = (String(DEBUG_LOGS).toLowerCase() === 'true');
+const DBG_VAD = (String(DEBUG_VAD).toLowerCase() === 'true');
+const OUTBUF_MS = Math.max(0, parseInt(OUT_JITTER_MS, 10) || 0);
+const PREFILL_MS = Math.max(0, parseInt(PREBUFFER_MS, 10) || 0);
 
 const app = express();
 app.use(express.json());
@@ -29,19 +33,16 @@ app.use(express.static('public'));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const client = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN,
-  {
-    edge: 'dublin',  // Force Twilio to use Ireland edge servers
-    region: 'ie1'    // Optional, but improves stability
-  }
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  { edge: TWILIO_EDGE, region: TWILIO_REGION }
 );
 
 // Node 18 has global fetch; provide fallback if needed
 const _fetch = (...args) =>
   (globalThis.fetch ? globalThis.fetch(...args) : import('node-fetch').then(({ default: f }) => f(...args)));
 
-// ------------------ AUDIO HELPERS ------------------
+/* ------------------ AUDIO HELPERS ------------------ */
 
 // μ-law byte -> PCM16 sample
 function muLawDecodeByte(mu) {
@@ -128,33 +129,31 @@ function rms(int16) {
   return Math.sqrt(acc / n);
 }
 
-// ------------------ ROUTES ------------------
+/* ------------------ ROUTES ------------------ */
 
-app.get('/health', (_req, res) => {
-  res.status(200).json({ status: 'ok' });
-});
-
+app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
 // Click-to-call test endpoint (POST {to?})
-app.post('/call', async (req, res) => {
+app.post('/test/call', async (req, res) => {
   try {
     const target = (req.body?.to || TEST_PHONE_NUMBER || '').replace(/[^\d+]/g, '');
     if (!/^\+\d{7,15}$/.test(target)) {
       return res.status(400).json({ message: 'Use E.164 like +353851234567' });
     }
-    if (!BASE_URL) return res.status(500).json({ message: 'Set BASE_URL (https ngrok URL)' });
+    if (!BASE_URL) return res.status(500).json({ message: 'Set BASE_URL to your production HTTPS domain' });
     if (!TWILIO_CALLER_ID) return res.status(500).json({ message: 'Set TWILIO_CALLER_ID' });
 
     const call = await client.calls.create({
       to: target,
       from: TWILIO_CALLER_ID,
-      url: `${BASE_URL}/twiml`
+      url: `${BASE_URL}/twiml`,
+      method: 'POST'
     });
 
     if (DEBUG) console.log('📞 Outbound call SID:', call.sid);
     res.json({ message: `Calling ${target}…`, sid: call.sid });
   } catch (e) {
-    console.error('❌ /call error:', e.message);
+    console.error('❌ /test/call error:', e.message);
     res.status(500).json({ message: e.message });
   }
 });
@@ -168,10 +167,10 @@ app.all('/twiml', (req, res) => {
   res.type('text/xml').send(vr.toString());
 });
 
-// ------------------ WS BRIDGE ------------------
+/* ------------------ WS BRIDGE ------------------ */
 
 const wss = new WebSocketServer({ noServer: true });
-const server = app.listen(PORT, () => console.log(`🚀 Server at http://localhost:${PORT}`));
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on 0.0.0.0:${PORT}`));
 
 // Accept /media even with query (?streamSid=...)
 server.on('upgrade', (req, socket, head) => {
@@ -185,23 +184,80 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', async (twilioWS) => {
+  /* ---- Keep the Twilio WS alive ---- */
+  const ka = setInterval(() => {
+    try { if (twilioWS.readyState === WebSocket.OPEN) twilioWS.ping(); } catch {}
+  }, 15000);
+  twilioWS.on('close', () => clearInterval(ka));
+  twilioWS.on('error', () => clearInterval(ka));
+
   // VAD state (fast + robust)
   let speaking = false;
   let lastVoiceMs = Date.now();
   let lastStartedAt = 0;
   let smooth = 0;
-  const VOICE_ON_RMS  = 700;  // lower = more sensitive
+  const VOICE_ON_RMS  = 700;     // lower = more sensitive
   const VOICE_OFF_RMS = 300;
-  const SILENCE_MS    = 400;  // quick stop for snappy replies
+  const SILENCE_MS    = 400;     // quick stop for snappy replies
   const MAX_UTTERANCE_MS = 7000; // hard cut after very long speech
   const FALLBACK_MS      = 1200; // ensure we always send a stop
-  const SMOOTH_A = 0.7; // EMA smoothing factor
+  const SMOOTH_A = 0.7;          // EMA smoothing factor
 
   let streamSid = null;
   let elOutFmt = 'pcm_16000';
   let elOutRate = 16000;
 
-  // Open ElevenLabs (public vs private)
+  /* ---- Outbound jitter buffer (EL -> Twilio) ---- */
+  const FRAME_MS = 20;
+  let outQueue = [];
+  let pumpTimer = null;
+  let buffering = false;
+  let prebuffer = [];
+
+  function startPump() {
+    if (pumpTimer) return;
+    pumpTimer = setInterval(() => {
+      if (outQueue.length && twilioWS.readyState === WebSocket.OPEN) {
+        const payloadB64 = outQueue.shift();
+        twilioWS.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: payloadB64 }
+        }));
+      }
+    }, FRAME_MS);
+  }
+
+  function sendToTwilio(payloadB64) {
+    outQueue.push(payloadB64);
+    if (outQueue.length * FRAME_MS >= OUTBUF_MS) startPump();
+  }
+
+  function startNewReply() {
+    if (PREFILL_MS > 0) {
+      buffering = true;
+      prebuffer = [];
+    } else {
+      buffering = false;
+      prebuffer = [];
+    }
+  }
+
+  function handleTTSChunk(payloadB64) {
+    if (buffering) {
+      prebuffer.push(payloadB64);
+      const bufferedMs = prebuffer.length * FRAME_MS;
+      if (bufferedMs >= PREFILL_MS) {
+        buffering = false;
+        for (const f of prebuffer) sendToTwilio(f);
+        prebuffer = [];
+      }
+    } else {
+      sendToTwilio(payloadB64);
+    }
+  }
+
+  /* ---- Open ElevenLabs WS ---- */
   async function openElevenLabsWS() {
     const id = ELEVENLABS_AGENT_ID || '';
     if (!id) throw new Error('ELEVENLABS_AGENT_ID missing');
@@ -228,6 +284,7 @@ wss.on('connection', async (twilioWS) => {
     return;
   }
 
+  /* ---- Keep EL WS alive ---- */
   elWS.on('open', () => {
     if (DEBUG) console.log('🎙️  ElevenLabs WS open');
 
@@ -240,6 +297,13 @@ wss.on('connection', async (twilioWS) => {
       }
     };
     try { elWS.send(JSON.stringify(init)); } catch {}
+
+    // keepalive
+    const elKA = setInterval(() => {
+      try { if (elWS.readyState === WebSocket.OPEN) elWS.ping(); } catch {}
+    }, 15000);
+    elWS.on('close', () => clearInterval(elKA));
+    elWS.on('error', () => clearInterval(elKA));
   });
   elWS.on('error', e => console.error('❌ ElevenLabs WS error:', e.message));
   elWS.on('close', () => { if (DEBUG) console.log('🛑 ElevenLabs WS closed'); });
@@ -261,15 +325,18 @@ wss.on('connection', async (twilioWS) => {
         return;
       }
 
-      // (Optional) You can log transcripts/responses if needed:
-      // if (data.type === 'user_transcript') console.log('🗣️', data.user_transcription_event?.user_transcript);
-      // if (data.type === 'agent_response') console.log('💬', data.agent_response_event?.agent_response);
+      if (data.type === 'agent_response') {
+        // new reply is starting -> prebuffer first chunks
+        startNewReply();
+        return;
+      }
 
       if (data.type === 'audio' && streamSid && twilioWS.readyState === WebSocket.OPEN) {
         const pcmB64 = data?.audio_event?.audio_base_64;
         if (!pcmB64) return;
         const ulawB64 = pcm16b64ToMuLaw8kB64_fromAnyRate(pcmB64, elOutRate || 16000);
-        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: ulawB64 } }));
+        handleTTSChunk(ulawB64);
+        return;
       }
     } catch { /* ignore non-JSON */ }
   });
@@ -296,7 +363,7 @@ wss.on('connection', async (twilioWS) => {
         }
 
         // 2) VAD — EMA-smoothed RMS with fast stop + fallbacks
-        let level = rms(pcm8);
+        const level = rms(pcm8);
         smooth = SMOOTH_A * smooth + (1 - SMOOTH_A) * level;
 
         const now = Date.now();
@@ -314,14 +381,17 @@ wss.on('connection', async (twilioWS) => {
           if (speaking && (silentFor > SILENCE_MS || longSpeech)) {
             try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {}
             speaking = false;
+            // next agent turn will start -> enable prebuffer
+            startNewReply();
             if (DBG_VAD) console.log('🤫 VAD stop', longSpeech ? '(max utterance)' : '');
           }
         }
 
-        // 3) Safety fallback: if we started but didn't stop cleanly
+        // 3) Safety fallback
         if (!speaking && lastStartedAt && (now - lastVoiceMs) > FALLBACK_MS && (now - lastStartedAt) > 500) {
           try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {}
           lastStartedAt = 0;
+          startNewReply();
           if (DBG_VAD) console.log('🛟 VAD forced stop');
         }
 
@@ -345,4 +415,5 @@ wss.on('connection', async (twilioWS) => {
   twilioWS.on('error', e => console.error('❌ Twilio WS error:', e.message));
   twilioWS.on('close', () => { try { elWS.close(); } catch {} });
 });
-// ------------------ END ------------------
+
+/* ------------------ END ------------------ */
