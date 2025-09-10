@@ -1,4 +1,4 @@
-// server.js — Twilio <-> ElevenLabs with fast VAD + proper codecs + jitter buffer
+// server.js — Twilio <-> ElevenLabs with VAD + jitter buffer + keepalive + test-call routes
 import 'dotenv/config';
 import express from 'express';
 import twilio from 'twilio';
@@ -7,23 +7,27 @@ import WebSocket, { WebSocketServer } from 'ws';
 /* ------------------ ENV ------------------ */
 const {
   PORT = 3000,
-  BASE_URL,                         // https public URL of THIS service (Railway)
+  BASE_URL,                         // public HTTPS of this service
+  // Twilio auth (prefer API Key)
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
+  TWILIO_API_KEY_SID,
+  TWILIO_API_KEY_SECRET,
   TWILIO_CALLER_ID,                 // your Twilio number (+E.164)
+  // ElevenLabs
   ELEVENLABS_AGENT_ID,              // public: agent_... ; private: UUID
   ELEVENLABS_API_KEY,               // required for private agents
-  TEST_PHONE_NUMBER,                // optional default test target
-  DEBUG_LOGS = 'false',             // 'true' to see more logs
-  DEBUG_VAD = 'false',              // 'true' to log VAD start/stop
-  TWILIO_EDGE = 'dublin',           // override with 'frankfurt' if you want
-  TWILIO_REGION = 'ie1',            // stable IE routing
-  OUT_JITTER_MS = '100',            // outbound EL->Twilio jitter buffer (ms)
+  // Diagnostics / tuning
+  DEBUG_LOGS = 'false',
+  DEBUG_VAD = 'false',
+  TWILIO_EDGE = 'dublin',           // 'dublin' | 'frankfurt' | ...
+  TWILIO_REGION = 'ie1',
+  OUT_JITTER_MS = '100',            // EL -> Twilio buffer (ms)
   PREBUFFER_MS = '250',             // initial TTS prebuffer (ms)
 } = process.env;
 
-const DEBUG = (String(DEBUG_LOGS).toLowerCase() === 'true');
-const DBG_VAD = (String(DEBUG_VAD).toLowerCase() === 'true');
+const DEBUG = String(DEBUG_LOGS).toLowerCase() === 'true';
+const DBG_VAD = String(DEBUG_VAD).toLowerCase() === 'true';
 const OUTBUF_MS = Math.max(0, parseInt(OUT_JITTER_MS, 10) || 0);
 const PREFILL_MS = Math.max(0, parseInt(PREBUFFER_MS, 10) || 0);
 
@@ -31,12 +35,22 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
+/* ------------------ Twilio Client ------------------ */
+// Prefer API Key auth; fallback to Account SID + Auth Token
+let client;
+if (TWILIO_API_KEY_SID && TWILIO_API_KEY_SECRET) {
+  client = twilio(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, {
+    accountSid: TWILIO_ACCOUNT_SID,
+    edge: TWILIO_EDGE,
+    region: TWILIO_REGION,
+  });
+} else {
+  client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, {
+    edge: TWILIO_EDGE,
+    region: TWILIO_REGION,
+  });
+}
 const VoiceResponse = twilio.twiml.VoiceResponse;
-const client = twilio(
-  TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN,
-  { edge: TWILIO_EDGE, region: TWILIO_REGION }
-);
 
 // Node 18 has global fetch; provide fallback if needed
 const _fetch = (...args) =>
@@ -91,7 +105,7 @@ function linearToMuLawSample(sample) {
   if (sample > 32767) sample = 32767;
   if (sample < -32768) sample = -32768;
   const BIAS = 0x84, CLIP = 32635;
-  let sign = (sample < 0) ? 0x80 : 0x00;
+  let sign = sample < 0 ? 0x80 : 0x00;
   if (sample < 0) sample = -sample;
   if (sample > CLIP) sample = CLIP;
   sample += BIAS;
@@ -133,39 +147,51 @@ function rms(int16) {
 
 app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
 
-// Click-to-call test endpoint (POST {to?})
-app.post('/test/call', async (req, res) => {
-  try {
-    const target = (req.body?.to || TEST_PHONE_NUMBER || '').replace(/[^\d+]/g, '');
-    if (!/^\+\d{7,15}$/.test(target)) {
-      return res.status(400).json({ message: 'Use E.164 like +353851234567' });
-    }
-    if (!BASE_URL) return res.status(500).json({ message: 'Set BASE_URL to your production HTTPS domain' });
-    if (!TWILIO_CALLER_ID) return res.status(500).json({ message: 'Set TWILIO_CALLER_ID' });
-
-    const call = await client.calls.create({
-      to: target,
-      from: TWILIO_CALLER_ID,
-      url: `${BASE_URL}/twiml`,
-      method: 'POST'
-    });
-
-    if (DEBUG) console.log('📞 Outbound call SID:', call.sid);
-    res.json({ message: `Calling ${target}…`, sid: call.sid });
-  } catch (e) {
-    console.error('❌ /test/call error:', e.message);
-    res.status(500).json({ message: e.message });
-  }
-});
-
 // TwiML → open a bidirectional stream
 app.all('/twiml', (req, res) => {
   if (!BASE_URL) return res.status(500).send('Set BASE_URL');
   if (DEBUG) console.log('📡 Twilio fetched /twiml via', req.method);
   const vr = new VoiceResponse();
-  vr.connect().stream({ url: `${BASE_URL.replace('https','wss')}/media` });
+  vr.connect().stream({ url: `${BASE_URL.replace('https', 'wss')}/media` });
   res.type('text/xml').send(vr.toString());
 });
+
+// shared call handler for /call and /test/call
+function validateE164(n) { return /^\+\d{7,15}$/.test(n || ''); }
+
+async function placeCall(req, res) {
+  try {
+    const to = (req.body?.to || '').replace(/[^\d+]/g, '');
+    if (!validateE164(to)) {
+      return res.status(400).json({ error: 'Provide a valid +E.164 number, e.g. +353851234567' });
+    }
+    if (!validateE164(TWILIO_CALLER_ID)) {
+      return res.status(500).json({ error: 'TWILIO_CALLER_ID is missing or not E.164' });
+    }
+    if (!BASE_URL) {
+      return res.status(500).json({ error: 'BASE_URL is not set' });
+    }
+    const call = await client.calls.create({
+      to,
+      from: TWILIO_CALLER_ID,
+      url: `${BASE_URL}/twiml`,
+      method: 'POST',
+    });
+    return res.json({ message: `Calling ${to}`, sid: call.sid });
+  } catch (e) {
+    const status = e.status || e.statusCode || 500;
+    if (DEBUG) console.error('Twilio call error:', status, e.code, e.message, e.moreInfo || '');
+    return res.status(status).json({
+      error: 'Twilio API Error',
+      code: e.code,
+      message: e.message,
+      details: e.moreInfo || null,
+    });
+  }
+}
+
+// accept either path
+app.post(['/call', '/test/call'], placeCall);
 
 /* ------------------ WS BRIDGE ------------------ */
 
@@ -326,7 +352,7 @@ wss.on('connection', async (twilioWS) => {
       }
 
       if (data.type === 'agent_response') {
-        // new reply is starting -> prebuffer first chunks
+        // new reply begins → enable prebuffer
         startNewReply();
         return;
       }
@@ -381,8 +407,7 @@ wss.on('connection', async (twilioWS) => {
           if (speaking && (silentFor > SILENCE_MS || longSpeech)) {
             try { elWS.send(JSON.stringify({ type: 'user_stopped_speaking' })); } catch {}
             speaking = false;
-            // next agent turn will start -> enable prebuffer
-            startNewReply();
+            startNewReply(); // next agent turn
             if (DBG_VAD) console.log('🤫 VAD stop', longSpeech ? '(max utterance)' : '');
           }
         }
